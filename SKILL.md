@@ -283,19 +283,83 @@ c.set('auth', auth);
 ### Route Structure
 ```typescript
 // Each route file exports a single OpenAPIHono router
+import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
+import { z } from 'zod';
+import { 
+  createClientSchema, 
+  clientResponseSchema 
+} from '~/lib/db/schema/clients.zod';  // ✅ Generated from Drizzle table
+import { clients } from '~/lib/db/schema/clients';
+
 const router = new OpenAPIHono<ApiContext>();
 
+// List clients
 const listRoute = createRoute({
   method: 'get',
   path: '/',
-  request: { query: PaginationQuerySchema },
+  request: { query: z.object({ page: z.coerce.number().default(1) }) },
   responses: {
-    200: { content: { 'application/json': { schema: z.array(ItemSchema) } }, description: 'List' },
+    200: { 
+      content: { 
+        'application/json': { 
+          schema: z.object({
+            clients: z.array(clientResponseSchema),  // ✅ From drizzle-zod
+            total: z.number(),
+          })
+        } 
+      }, 
+      description: 'List clients' 
+    },
   },
 });
 
-router.openapi(listRoute, async (c) => { /* handler */ });
-export { router as itemRouter };
+router.openapi(listRoute, async (c) => {
+  const { page } = c.req.valid('query');
+  const query = c.get('query');  // RLS-scoped
+  
+  const clientsList = await query
+    .select()
+    .from(clients)
+    .limit(20)
+    .offset((page - 1) * 20);
+  
+  return c.json({ clients: clientsList, total: clientsList.length });
+});
+
+// Create client
+const createRoute = createRoute({
+  method: 'post',
+  path: '/',
+  request: {
+    body: {
+      content: {
+        'application/json': { schema: createClientSchema },  // ✅ From drizzle-zod
+      },
+    },
+  },
+  responses: {
+    201: {
+      content: {
+        'application/json': { schema: clientResponseSchema },  // ✅ From drizzle-zod
+      },
+      description: 'Client created',
+    },
+  },
+});
+
+router.openapi(createRoute, async (c) => {
+  const data = c.req.valid('json');  // ✅ Typed as createClientSchema
+  const query = c.get('query');
+  
+  const [client] = await query
+    .insert(clients)
+    .values(data)
+    .returning();
+  
+  return c.json(client, 201);
+});
+
+export { router as clientsRouter };
 ```
 
 ### Middleware Stack (order matters)
@@ -408,13 +472,202 @@ npm run gen:auth       # Regenerates auth schema from better-auth config
 ```
 Migration files in `drizzle/` — never hand-edit. If you need a custom migration, use Drizzle Kit's `custom` option.
 
-### Drizzle-Zod Derivation
-```typescript
-import { createSelectSchema, createInsertSchema } from 'drizzle-zod';
-const ClientSelect = createSelectSchema(clients);
-const ClientInsert = createInsertSchema(clients);
+### Drizzle-Zod Schema Generation
+
+**CRITICAL RULE:** Use `drizzle-zod` helpers to generate Zod schemas from Drizzle tables. Never manually write schemas that duplicate table structure.
+
+#### Installation
+```bash
+npm install drizzle-zod
 ```
-Derive from Drizzle, extend for API-specific shapes. Never duplicate the schema definition.
+
+#### Pattern: Single Source of Truth
+
+```typescript
+// ❌ ANTI-PATTERN: Manual schema duplication
+import { z } from 'zod';
+
+const ClientSchema = z.object({
+  id: z.number(),
+  orgId: z.number(),
+  name: z.string(),
+  email: z.string().email(),
+  createdAt: z.date(),
+  updatedAt: z.date(),
+  // ⚠️ If table changes, this breaks silently!
+});
+
+// ✅ CORRECT: Generate from Drizzle table
+import { createInsertSchema, createSelectSchema } from 'drizzle-zod';
+import { clients } from './schema/clients';
+
+// Full schemas
+export const selectClientSchema = createSelectSchema(clients);
+export const insertClientSchema = createInsertSchema(clients);
+
+// API-specific refinements
+export const createClientSchema = insertClientSchema
+  .omit({ id: true, createdAt: true, updatedAt: true }) // auto-generated fields
+  .extend({
+    email: z.string().email().toLowerCase(), // additional validation
+  });
+
+export const updateClientSchema = insertClientSchema
+  .omit({ id: true, orgId: true, createdAt: true, updatedAt: true })
+  .partial(); // all fields optional for PATCH
+
+export const clientResponseSchema = selectClientSchema
+  .omit({ orgId: true }); // don't expose internal IDs in API responses
+```
+
+#### Available Helpers
+
+```typescript
+import { 
+  createInsertSchema,  // For INSERT operations (excludes auto-generated fields)
+  createSelectSchema,  // For SELECT results (all fields)
+  createUpdateSchema,  // For UPDATE operations (like insert but may differ)
+} from 'drizzle-zod';
+
+const insertSchema = createInsertSchema(clients);    // Omits serial/identity PKs
+const selectSchema = createSelectSchema(clients);    // Includes all columns
+const updateSchema = createUpdateSchema(clients);    // Same as insert by default
+```
+
+#### Refining Generated Schemas
+
+```typescript
+import { createInsertSchema } from 'drizzle-zod';
+import { clients } from './schema/clients';
+import { z } from 'zod';
+
+// Add custom validation beyond what Drizzle knows
+export const insertClientSchema = createInsertSchema(clients, {
+  email: z.string().email().toLowerCase(),           // additional transform
+  name: z.string().min(2).max(100),                  // length constraints
+  phone: z.string().regex(/^\d{10}$/).optional(),    // format validation
+});
+
+// Create endpoint-specific variants
+export const createClientSchema = insertClientSchema
+  .omit({ id: true, createdAt: true, updatedAt: true });
+
+export const updateClientSchema = insertClientSchema
+  .omit({ id: true, orgId: true, createdAt: true, updatedAt: true })
+  .partial();  // all fields optional
+
+export const patchClientNameSchema = insertClientSchema
+  .pick({ name: true });  // only allow name updates on this endpoint
+```
+
+#### Usage in API Routes
+
+```typescript
+// lib/api/routes/practitioner/clients.ts
+import { createRoute } from '@hono/zod-openapi';
+import { 
+  createClientSchema, 
+  updateClientSchema, 
+  clientResponseSchema 
+} from '~/lib/db/schema/clients.zod';
+
+const createRoute = createRoute({
+  method: 'post',
+  path: '/clients',
+  request: {
+    body: {
+      content: {
+        'application/json': { schema: createClientSchema },
+      },
+    },
+  },
+  responses: {
+    201: {
+      content: {
+        'application/json': { schema: clientResponseSchema },
+      },
+      description: 'Client created',
+    },
+  },
+});
+
+router.openapi(createRoute, async (c) => {
+  const data = c.req.valid('json');  // ✅ Typed as createClientSchema
+  const query = c.get('query');
+
+  const [client] = await query
+    .insert(clients)
+    .values(data)
+    .returning();
+
+  return c.json(client, 201);  // ✅ Typed as clientResponseSchema
+});
+```
+
+#### Why This Matters
+
+**Single source of truth:**
+```
+Drizzle table definition
+  ↓ (drizzle-zod generates)
+Zod schemas
+  ↓ (used in createRoute)
+OpenAPI spec
+  ↓ (npm run gen:api)
+TypeScript types
+  ↓ (used in frontend)
+Fully typed API calls
+```
+
+**Change the table, everything updates:**
+1. Add column to Drizzle schema
+2. Run `npm run db:generate && npm run db:migrate`
+3. Zod schemas auto-update (they're derived, not manual)
+4. Run `npm run gen:api`
+5. TypeScript errors show every API call that needs updating
+
+**Without drizzle-zod:**
+- Change table → manually update Zod schema → easy to forget fields
+- Schemas drift from tables over time
+- Runtime errors from schema mismatches
+
+#### File Organization
+
+```
+lib/db/schema/
+  clients.ts           # Drizzle table definition
+  clients.zod.ts       # Generated Zod schemas + API refinements
+  index.ts             # Barrel exports
+```
+
+```typescript
+// clients.zod.ts
+import { createInsertSchema, createSelectSchema } from 'drizzle-zod';
+import { clients } from './clients';
+import { z } from 'zod';
+
+export const selectClientSchema = createSelectSchema(clients);
+export const insertClientSchema = createInsertSchema(clients);
+
+export const createClientSchema = insertClientSchema
+  .omit({ id: true, createdAt: true, updatedAt: true });
+
+export const updateClientSchema = insertClientSchema
+  .omit({ id: true, orgId: true, createdAt: true, updatedAt: true })
+  .partial();
+
+export const clientResponseSchema = selectClientSchema
+  .omit({ orgId: true });  // don't leak internal IDs
+```
+
+**Import pattern:**
+```typescript
+// ✅ Import from .zod file for API routes
+import { createClientSchema } from '~/lib/db/schema/clients.zod';
+
+// ✅ Import table from base file for queries
+import { clients } from '~/lib/db/schema/clients';
+```
 
 ## 5. AUTH PATTERNS (better-auth)
 
