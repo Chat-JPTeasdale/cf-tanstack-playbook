@@ -280,32 +280,102 @@ c.set('db', db);
 c.set('auth', auth);
 ```
 
-### Route Structure
+### Pagination Pattern
+
+**CRITICAL RULE:** Every list endpoint MUST support pagination. Never return unbounded result sets.
+
+#### Standard Pagination Schema
+
 ```typescript
-// Each route file exports a single OpenAPIHono router
-import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
+// lib/api/schemas/pagination.ts
 import { z } from 'zod';
-import { 
-  createClientSchema, 
-  clientResponseSchema 
-} from '~/lib/db/schema/clients.zod';  // ✅ Generated from Drizzle table
+
+export const paginationQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+export type PaginationQuery = z.infer<typeof paginationQuerySchema>;
+
+export const paginatedResponseSchema = <T extends z.ZodTypeAny>(itemSchema: T) =>
+  z.object({
+    data: z.array(itemSchema),
+    pagination: z.object({
+      page: z.number(),
+      limit: z.number(),
+      total: z.number(),
+      totalPages: z.number(),
+      hasNext: z.boolean(),
+      hasPrev: z.boolean(),
+    }),
+  });
+```
+
+#### Pagination Helper
+
+```typescript
+// lib/api/utils/pagination.ts
+export interface PaginationParams {
+  page: number;
+  limit: number;
+}
+
+export interface PaginationMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+  hasNext: boolean;
+  hasPrev: boolean;
+}
+
+export function getPaginationMeta(
+  params: PaginationParams,
+  total: number
+): PaginationMeta {
+  const totalPages = Math.ceil(total / params.limit);
+  return {
+    page: params.page,
+    limit: params.limit,
+    total,
+    totalPages,
+    hasNext: params.page < totalPages,
+    hasPrev: params.page > 1,
+  };
+}
+
+export function applyPagination<T>(
+  query: any, // Drizzle query builder
+  params: PaginationParams
+) {
+  return query
+    .limit(params.limit)
+    .offset((params.page - 1) * params.limit);
+}
+```
+
+#### Usage in Routes
+
+```typescript
+// lib/api/routes/practitioner/clients.ts
+import { createRoute } from '@hono/zod-openapi';
+import { count } from 'drizzle-orm';
+import { paginationQuerySchema, paginatedResponseSchema } from '~/lib/api/schemas/pagination';
+import { getPaginationMeta, applyPagination } from '~/lib/api/utils/pagination';
+import { clientResponseSchema } from '~/lib/db/schema/clients.zod';
 import { clients } from '~/lib/db/schema/clients';
 
-const router = new OpenAPIHono<ApiContext>();
-
-// List clients
 const listRoute = createRoute({
   method: 'get',
   path: '/',
-  request: { query: z.object({ page: z.coerce.number().default(1) }) },
+  request: { 
+    query: paginationQuerySchema  // ✅ Standard pagination
+  },
   responses: {
     200: { 
       content: { 
         'application/json': { 
-          schema: z.object({
-            clients: z.array(clientResponseSchema),  // ✅ From drizzle-zod
-            total: z.number(),
-          })
+          schema: paginatedResponseSchema(clientResponseSchema)  // ✅ Standard wrapper
         } 
       }, 
       description: 'List clients' 
@@ -314,16 +384,145 @@ const listRoute = createRoute({
 });
 
 router.openapi(listRoute, async (c) => {
-  const { page } = c.req.valid('query');
+  const params = c.req.valid('query');  // { page: 1, limit: 20 }
   const query = c.get('query');  // RLS-scoped
   
-  const clientsList = await query
+  // Get total count (for pagination meta)
+  const [{ total }] = await query
+    .select({ total: count() })
+    .from(clients);
+  
+  // Get paginated data
+  const data = await applyPagination(
+    query.select().from(clients),
+    params
+  );
+  
+  return c.json({
+    data,
+    pagination: getPaginationMeta(params, total),
+  });
+});
+```
+
+#### Advanced: Cursor-Based Pagination
+
+For high-performance pagination on large datasets:
+
+```typescript
+// lib/api/schemas/cursor.ts
+export const cursorPaginationQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  cursor: z.string().optional(),  // base64-encoded { id, createdAt }
+});
+
+export const cursorPaginatedResponseSchema = <T extends z.ZodTypeAny>(itemSchema: T) =>
+  z.object({
+    data: z.array(itemSchema),
+    nextCursor: z.string().nullable(),
+    hasMore: z.boolean(),
+  });
+
+// Usage
+router.openapi(listRoute, async (c) => {
+  const { limit, cursor } = c.req.valid('query');
+  const query = c.get('query');
+  
+  let where = undefined;
+  if (cursor) {
+    const decoded = JSON.parse(Buffer.from(cursor, 'base64').toString());
+    where = lt(clients.createdAt, new Date(decoded.createdAt));
+  }
+  
+  const data = await query
     .select()
     .from(clients)
-    .limit(20)
-    .offset((page - 1) * 20);
+    .where(where)
+    .orderBy(desc(clients.createdAt))
+    .limit(limit + 1);  // Fetch one extra to check hasMore
   
-  return c.json({ clients: clientsList, total: clientsList.length });
+  const hasMore = data.length > limit;
+  const items = hasMore ? data.slice(0, -1) : data;
+  
+  const nextCursor = hasMore && items.length > 0
+    ? Buffer.from(JSON.stringify({ 
+        id: items[items.length - 1].id,
+        createdAt: items[items.length - 1].createdAt 
+      })).toString('base64')
+    : null;
+  
+  return c.json({ data: items, nextCursor, hasMore });
+});
+```
+
+#### When to Use Each
+
+- **Offset pagination (`page` + `limit`):**
+  - Default for most list endpoints
+  - User needs to jump to specific pages
+  - Dataset is < 10,000 rows
+  - Sorting by fields other than creation time
+
+- **Cursor pagination:**
+  - Infinite scroll UIs
+  - Large datasets (> 10,000 rows)
+  - Real-time feeds (new items appear frequently)
+  - Performance is critical
+
+### Route Structure
+```typescript
+// Each route file exports a single OpenAPIHono router
+import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
+import { z } from 'zod';
+import { count } from 'drizzle-orm';
+import { 
+  createClientSchema, 
+  clientResponseSchema 
+} from '~/lib/db/schema/clients.zod';  // ✅ Generated from Drizzle table
+import { clients } from '~/lib/db/schema/clients';
+import { paginationQuerySchema, paginatedResponseSchema } from '~/lib/api/schemas/pagination';
+import { getPaginationMeta, applyPagination } from '~/lib/api/utils/pagination';
+
+const router = new OpenAPIHono<ApiContext>();
+
+// List clients with pagination
+const listRoute = createRoute({
+  method: 'get',
+  path: '/',
+  request: { 
+    query: paginationQuerySchema  // ✅ Every list endpoint has pagination
+  },
+  responses: {
+    200: { 
+      content: { 
+        'application/json': { 
+          schema: paginatedResponseSchema(clientResponseSchema)  // ✅ Standard wrapper
+        } 
+      }, 
+      description: 'List clients with pagination' 
+    },
+  },
+});
+
+router.openapi(listRoute, async (c) => {
+  const params = c.req.valid('query');
+  const query = c.get('query');  // RLS-scoped
+  
+  // Get total count
+  const [{ total }] = await query
+    .select({ total: count() })
+    .from(clients);
+  
+  // Get paginated data
+  const data = await applyPagination(
+    query.select().from(clients),
+    params
+  );
+  
+  return c.json({
+    data,
+    pagination: getPaginationMeta(params, total),
+  });
 });
 
 // Create client
@@ -944,3 +1143,5 @@ Assess in this order:
 - **Missing seed step in preview workflow** — empty tables on preview = broken preview.
 - **Neon Auth cookie forwarding without the correct pattern** — must forward the raw cookie header, not use browser client server-side.
 - **Duplicated auth middleware** — session validation in two files inevitably drifts. Single source of truth.
+- **Unbounded list endpoints** — returning all rows without pagination causes timeouts and crashes on production data. Every list endpoint MUST have `page` + `limit` parameters and return paginated responses.
+- **Manual Zod schemas duplicating Drizzle tables** — use `createInsertSchema`/`createSelectSchema` from drizzle-zod. Manual schemas drift from tables and break silently.
