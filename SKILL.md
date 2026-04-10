@@ -29,8 +29,8 @@ Derived from production patterns. Every rule exists because the alternative caus
   Browser ── /* ────────>│  TanStack Start (SSR)                    │
                          │    ├── __root.tsx (getSession)           │
                          │    ├── routes/* (file-based routing)     │
-                         │    └── Server Functions                  │
-                         │        (createServerFn + middleware)     │
+                         │    └── Server Functions (AUTH ONLY)      │
+                         │        getSession() via better-auth      │
                          │              │                           │
                          └──────────────┼───────────────────────────┘
                                         │
@@ -54,8 +54,8 @@ Derived from production patterns. Every rule exists because the alternative caus
 
 | Layer | Technology | Responsibility | Why This Choice |
 |-------|-----------|---------------|-----------------|
-| **SSR Frontend** | TanStack Start | Server-rendered React pages, file-based routing, `createServerFn` for page data loading | Full React 19 SSR on CF Workers with streaming |
-| **Typed REST API** | Hono (OpenAPIHono) | All business logic, CRUD operations, integrations | Consumable by any client (mobile, CLI, third-party). TanStack server functions are NOT externally consumable — they're tied to the React component tree |
+| **SSR Frontend** | TanStack Start | Server-rendered React pages, file-based routing, `useSession()` hook for auth | Full React 19 SSR on CF Workers with streaming. Uses `createServerFn` ONLY for `getSession()` — NOT for page data |
+| **Typed REST API** | Hono (OpenAPIHono) | **ALL business logic, CRUD operations, integrations, 99% of database connections** | Consumable by any client (mobile, CLI, third-party). Frontend loads ALL page data via `useApiQuery`/`useApiMutation`. **ANTI-PATTERN:** Using `createServerFn` for data (locks you into TanStack Start, can't be consumed by other clients) |
 | **Auth** | better-auth | User accounts, sessions, email OTP, organizations, invitations, role management | Generates its own Drizzle schema (`schema/auth.ts`). Runs as Hono middleware on `/api/auth/*` AND as TanStack Start server function for SSR session loading |
 | **Database** | Drizzle ORM + Neon | Schema definition, migrations, type-safe queries | All non-auth tables are RLS-protected. Auth tables are managed by better-auth (no manual RLS needed — better-auth handles its own access control) |
 | **Connection Pool** | Cloudflare Hyperdrive | Persistent TCP connections to Neon from the edge | Eliminates cold-start latency for DB connections. Handles TLS termination |
@@ -92,6 +92,122 @@ Derived from production patterns. Every rule exists because the alternative caus
 6. Response validated against Zod response schema
 7. openapi-react-query invalidates relevant query cache
 ```
+
+### Type Generation Flow (`npm run gen:api`)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. Define Hono route with Zod schemas                          │
+│    const createClientRoute = createRoute({                      │
+│      method: 'post',                                           │
+│      path: '/clients',                                         │
+│      request: { body: { content: { 'application/json':        │
+│        { schema: CreateClientSchema } } } },                   │
+│      responses: { 201: { content: { 'application/json':       │
+│        { schema: ClientSchema } } } }                          │
+│    })                                                          │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. Hono OpenAPI generates /api/openapi.json spec               │
+│    GET /api/openapi.json → OpenAPI 3.1 JSON                    │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. npm run gen:api (openapi-typescript)                        │
+│    curl http://localhost:3000/api/openapi.json                 │
+│    | npx openapi-typescript > src/lib/api/v1.d.ts              │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. Frontend imports typed client                               │
+│    import createClient from 'openapi-fetch'                    │
+│    import type { paths } from '~/lib/api/v1'                   │
+│    const client = createClient<paths>({ baseUrl: '/api' })     │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 5. Component uses fully typed hooks                            │
+│    const { data } = api.useQuery('post', '/v1/clients', {      │
+│      body: { name, email } // ← TypeScript enforces schema     │
+│    })                                                          │
+│    // data is typed as ClientSchema                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key benefit:** Change a Zod schema in the API, run `npm run gen:api`, and TypeScript errors immediately show you every frontend callsite that needs updating. Zero manual type maintenance.
+
+### ⚠️ Data Loading Anti-Patterns
+
+**❌ ANTI-PATTERN: Using `createServerFn` for page data**
+
+```typescript
+// DON'T DO THIS ❌
+export const getClients = createServerFn({ method: 'GET' })
+  .middleware([sessionMiddleware])
+  .handler(async ({ context }) => {
+    const db = createDb(context.env.DB.connectionString)
+    return db.select().from(clients).where(eq(clients.orgId, context.session.activeOrganizationId))
+  })
+
+// Component
+function ClientsList() {
+  const clients = await getClients() // ❌ Locked into TanStack Start
+  return <div>{clients.map(...)}</div>
+}
+```
+
+**Why this is bad:**
+1. **Not consumable by other clients** - Mobile app, CLI tool, or third-party integrations can't call `getClients()`
+2. **Duplicates business logic** - If you later build a mobile app, you'll rewrite this in the API anyway
+3. **No OpenAPI spec** - Can't generate types, no Swagger docs, no Postman collection
+4. **Bypasses RLS middleware** - Have to manually replicate org membership checks everywhere
+
+**✅ CORRECT PATTERN: All data through Hono API**
+
+```typescript
+// In Hono API (lib/api/routes/practitioner/clients.ts)
+const listRoute = createRoute({
+  method: 'get',
+  path: '/clients',
+  responses: {
+    200: { content: { 'application/json': { schema: z.array(ClientSchema) } } }
+  }
+})
+
+router.openapi(listRoute, async (c) => {
+  const query = c.get('query') // RLS-scoped, auto-filtered to current org
+  return c.json(await query.select().from(clients))
+})
+
+// Frontend component
+function ClientsList() {
+  const { data: clients } = api.useQuery('get', '/v1/practitioner/clients')
+  if (!clients) return <div>Loading...</div>
+  return <div>{clients.map(...)}</div>
+}
+```
+
+**Why this is correct:**
+1. ✅ **Consumable by any client** - Mobile, CLI, webhooks, third-party integrations
+2. ✅ **Single source of truth** - Business logic lives in one place (Hono)
+3. ✅ **Auto-generated types** - `npm run gen:api` keeps frontend in sync
+4. ✅ **RLS enforced automatically** - Middleware ensures row-level security
+5. ✅ **OpenAPI documentation** - Free Swagger docs, Postman collections, API reference
+
+**The ONLY valid use of `createServerFn`:**
+
+```typescript
+// lib/auth/session.ts
+export const getSession = createServerFn({ method: 'GET' })
+  .middleware([sessionMiddleware])
+  .handler(async ({ context }) => {
+    const auth = context.auth
+    return auth.api.getSession({ headers: context.request.headers })
+  })
+```
+
+Used in `__root.tsx` to inject session into route context. That's it. Nothing else.
 
 ### Auth Table Ownership
 better-auth manages these tables (generated by `npm run gen:auth`):
@@ -217,7 +333,13 @@ declare module '@tanstack/react-start' {
 }
 ```
 
-**Key insight:** The Hono API and TanStack Start share the same Worker but are independent apps. The API has its own middleware stack, auth validation, and DB connections. TanStack Start has its own server functions and middleware via `createMiddleware`/`createServerFn`.
+**Key insight:** The Hono API and TanStack Start share the same Worker but are independent apps. The API has its own middleware stack, auth validation, and DB connections. TanStack Start uses `createServerFn` ONLY for `getSession()` via better-auth.
+
+**CRITICAL ARCHITECTURAL RULE:**
+- ✅ TanStack Start → Routing + `useSession()` from better-auth  
+- ✅ Hono API → **ALL data/business logic** (99% of DB connections)  
+- ✅ Frontend data loading → `useApiQuery` / `useApiMutation` (typed from Hono via `npm run gen:api`)  
+- ❌ **ANTI-PATTERN:** Using `createServerFn` for page data (not consumable by mobile apps, CLI tools, or third-party integrations)
 
 ## 3. API ARCHITECTURE
 
