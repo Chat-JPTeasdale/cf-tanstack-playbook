@@ -346,16 +346,11 @@ import postgres from 'postgres';
 import { drizzle } from 'drizzle-orm/postgres-js';
 
 export function createDb(connectionString: string) {
-  const isHyperdrive = !connectionString.includes('.neon.tech');
-  const client = postgres(connectionString, {
-    ssl: isHyperdrive ? false : 'prefer',   // Hyperdrive handles TLS
-    prepare: isHyperdrive ? false : true,    // Hyperdrive pools connections
-    max: 1,
-  });
+  const client = postgres(connectionString, { max: 1 });
   return drizzle(client, { schema });
 }
 ```
-**Why the detection:** Direct Neon connections (local dev, scripts) need `ssl: 'prefer'`. Hyperdrive connections MUST have `ssl: false` and `prepare: false` — Hyperdrive handles TLS internally and prepared statements are connection-scoped.
+**Assumes Hyperdrive:** This pattern assumes all Worker connections go through Hyperdrive (which handles TLS, connection pooling, and prepared statements). For local dev/scripts connecting directly to Neon, use a separate helper or configure `ssl: 'prefer'` manually.
 
 ### Database Initialization (scripts/db-init-roles.ts)
 Run once per Neon project to set up the role hierarchy. **Roles are project-specific** — define them based on the application's access model.
