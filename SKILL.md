@@ -280,285 +280,22 @@ c.set('db', db);
 c.set('auth', auth);
 ```
 
-### Pagination Pattern
-
-**CRITICAL RULE:** Every list endpoint MUST support pagination. Never return unbounded result sets.
-
-#### Standard Pagination Schema
-
-```typescript
-// lib/api/schemas/pagination.ts
-import { z } from 'zod';
-
-export const paginationQuerySchema = z.object({
-  page: z.coerce.number().int().min(1).default(1),
-  limit: z.coerce.number().int().min(1).max(100).default(20),
-});
-
-export type PaginationQuery = z.infer<typeof paginationQuerySchema>;
-
-export const paginatedResponseSchema = <T extends z.ZodTypeAny>(itemSchema: T) =>
-  z.object({
-    data: z.array(itemSchema),
-    pagination: z.object({
-      page: z.number(),
-      limit: z.number(),
-      total: z.number(),
-      totalPages: z.number(),
-      hasNext: z.boolean(),
-      hasPrev: z.boolean(),
-    }),
-  });
-```
-
-#### Pagination Helper
-
-```typescript
-// lib/api/utils/pagination.ts
-export interface PaginationParams {
-  page: number;
-  limit: number;
-}
-
-export interface PaginationMeta {
-  page: number;
-  limit: number;
-  total: number;
-  totalPages: number;
-  hasNext: boolean;
-  hasPrev: boolean;
-}
-
-export function getPaginationMeta(
-  params: PaginationParams,
-  total: number
-): PaginationMeta {
-  const totalPages = Math.ceil(total / params.limit);
-  return {
-    page: params.page,
-    limit: params.limit,
-    total,
-    totalPages,
-    hasNext: params.page < totalPages,
-    hasPrev: params.page > 1,
-  };
-}
-
-export function applyPagination<T>(
-  query: any, // Drizzle query builder
-  params: PaginationParams
-) {
-  return query
-    .limit(params.limit)
-    .offset((params.page - 1) * params.limit);
-}
-```
-
-#### Usage in Routes
-
-```typescript
-// lib/api/routes/practitioner/clients.ts
-import { createRoute } from '@hono/zod-openapi';
-import { count } from 'drizzle-orm';
-import { paginationQuerySchema, paginatedResponseSchema } from '~/lib/api/schemas/pagination';
-import { getPaginationMeta, applyPagination } from '~/lib/api/utils/pagination';
-import { clientResponseSchema } from '~/lib/db/schema/clients.zod';
-import { clients } from '~/lib/db/schema/clients';
-
-const listRoute = createRoute({
-  method: 'get',
-  path: '/',
-  request: { 
-    query: paginationQuerySchema  // ✅ Standard pagination
-  },
-  responses: {
-    200: { 
-      content: { 
-        'application/json': { 
-          schema: paginatedResponseSchema(clientResponseSchema)  // ✅ Standard wrapper
-        } 
-      }, 
-      description: 'List clients' 
-    },
-  },
-});
-
-router.openapi(listRoute, async (c) => {
-  const params = c.req.valid('query');  // { page: 1, limit: 20 }
-  const query = c.get('query');  // RLS-scoped
-  
-  // Get total count (for pagination meta)
-  const [{ total }] = await query
-    .select({ total: count() })
-    .from(clients);
-  
-  // Get paginated data
-  const data = await applyPagination(
-    query.select().from(clients),
-    params
-  );
-  
-  return c.json({
-    data,
-    pagination: getPaginationMeta(params, total),
-  });
-});
-```
-
-#### Advanced: Cursor-Based Pagination
-
-For high-performance pagination on large datasets:
-
-```typescript
-// lib/api/schemas/cursor.ts
-export const cursorPaginationQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(100).default(20),
-  cursor: z.string().optional(),  // base64-encoded { id, createdAt }
-});
-
-export const cursorPaginatedResponseSchema = <T extends z.ZodTypeAny>(itemSchema: T) =>
-  z.object({
-    data: z.array(itemSchema),
-    nextCursor: z.string().nullable(),
-    hasMore: z.boolean(),
-  });
-
-// Usage
-router.openapi(listRoute, async (c) => {
-  const { limit, cursor } = c.req.valid('query');
-  const query = c.get('query');
-  
-  let where = undefined;
-  if (cursor) {
-    const decoded = JSON.parse(Buffer.from(cursor, 'base64').toString());
-    where = lt(clients.createdAt, new Date(decoded.createdAt));
-  }
-  
-  const data = await query
-    .select()
-    .from(clients)
-    .where(where)
-    .orderBy(desc(clients.createdAt))
-    .limit(limit + 1);  // Fetch one extra to check hasMore
-  
-  const hasMore = data.length > limit;
-  const items = hasMore ? data.slice(0, -1) : data;
-  
-  const nextCursor = hasMore && items.length > 0
-    ? Buffer.from(JSON.stringify({ 
-        id: items[items.length - 1].id,
-        createdAt: items[items.length - 1].createdAt 
-      })).toString('base64')
-    : null;
-  
-  return c.json({ data: items, nextCursor, hasMore });
-});
-```
-
-#### When to Use Each
-
-- **Offset pagination (`page` + `limit`):**
-  - Default for most list endpoints
-  - User needs to jump to specific pages
-  - Dataset is < 10,000 rows
-  - Sorting by fields other than creation time
-
-- **Cursor pagination:**
-  - Infinite scroll UIs
-  - Large datasets (> 10,000 rows)
-  - Real-time feeds (new items appear frequently)
-  - Performance is critical
-
 ### Route Structure
 ```typescript
 // Each route file exports a single OpenAPIHono router
-import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
-import { z } from 'zod';
-import { count } from 'drizzle-orm';
-import { 
-  createClientSchema, 
-  clientResponseSchema 
-} from '~/lib/db/schema/clients.zod';  // ✅ Generated from Drizzle table
-import { clients } from '~/lib/db/schema/clients';
-import { paginationQuerySchema, paginatedResponseSchema } from '~/lib/api/schemas/pagination';
-import { getPaginationMeta, applyPagination } from '~/lib/api/utils/pagination';
-
 const router = new OpenAPIHono<ApiContext>();
 
-// List clients with pagination
 const listRoute = createRoute({
   method: 'get',
   path: '/',
-  request: { 
-    query: paginationQuerySchema  // ✅ Every list endpoint has pagination
-  },
+  request: { query: PaginationQuerySchema },
   responses: {
-    200: { 
-      content: { 
-        'application/json': { 
-          schema: paginatedResponseSchema(clientResponseSchema)  // ✅ Standard wrapper
-        } 
-      }, 
-      description: 'List clients with pagination' 
-    },
+    200: { content: { 'application/json': { schema: z.array(ItemSchema) } }, description: 'List' },
   },
 });
 
-router.openapi(listRoute, async (c) => {
-  const params = c.req.valid('query');
-  const query = c.get('query');  // RLS-scoped
-  
-  // Get total count
-  const [{ total }] = await query
-    .select({ total: count() })
-    .from(clients);
-  
-  // Get paginated data
-  const data = await applyPagination(
-    query.select().from(clients),
-    params
-  );
-  
-  return c.json({
-    data,
-    pagination: getPaginationMeta(params, total),
-  });
-});
-
-// Create client
-const createRoute = createRoute({
-  method: 'post',
-  path: '/',
-  request: {
-    body: {
-      content: {
-        'application/json': { schema: createClientSchema },  // ✅ From drizzle-zod
-      },
-    },
-  },
-  responses: {
-    201: {
-      content: {
-        'application/json': { schema: clientResponseSchema },  // ✅ From drizzle-zod
-      },
-      description: 'Client created',
-    },
-  },
-});
-
-router.openapi(createRoute, async (c) => {
-  const data = c.req.valid('json');  // ✅ Typed as createClientSchema
-  const query = c.get('query');
-  
-  const [client] = await query
-    .insert(clients)
-    .values(data)
-    .returning();
-  
-  return c.json(client, 201);
-});
-
-export { router as clientsRouter };
+router.openapi(listRoute, async (c) => { /* handler */ });
+export { router as itemRouter };
 ```
 
 ### Middleware Stack (order matters)
@@ -621,28 +358,63 @@ export function createDb(connectionString: string) {
 **Why the detection:** Direct Neon connections (local dev, scripts) need `ssl: 'prefer'`. Hyperdrive connections MUST have `ssl: false` and `prepare: false` — Hyperdrive handles TLS internally and prepared statements are connection-scoped.
 
 ### Database Initialization (scripts/db-init-roles.ts)
-Run once per Neon project to set up the role hierarchy:
+Run once per Neon project to set up the role hierarchy. **Roles are project-specific** — define them based on the application's access model.
+
+#### Step 1: Define your roles
+Every project needs at minimum:
+- **One login role** — used by Hyperdrive to connect. Has no direct table access. Granted all data roles so it can `SET LOCAL ROLE` to any of them.
+- **One system role** — full CRUD, no RLS restrictions. Used by background jobs, webhooks, migrations.
+- **One or more scoped roles** — restricted by RLS policies. Define these based on your application's user types.
+
+Example role definitions by project type:
+
+| Project Type | Login Role | Data Roles | Notes |
+|-------------|-----------|------------|-------|
+| **SaaS with orgs** (Cohealer) | `visitor_role` | `ch_admin`, `ch_practitioner`, `ch_client`, `ch_system` | Org-scoped RLS on most tables |
+| **Consumer app** (Date v6) | `dt_visitor` | `dt_visitor` (public read), `dt_system` (admin CRUD) | Simple visitor/admin split |
+| **Multi-tenant marketplace** | `app_visitor` | `mt_vendor`, `mt_buyer`, `mt_admin`, `mt_system` | Tenant-scoped RLS |
+| **Internal tool** | `tool_visitor` | `tool_user`, `tool_admin`, `tool_system` | Role-based, no multi-tenancy |
+
+#### Step 2: Create the init script
+The script uses the `neondb_owner` connection to create roles and grants:
 ```sql
 -- 1. Create login role (used by Hyperdrive)
-CREATE ROLE visitor_role LOGIN PASSWORD '...';
+CREATE ROLE <login_role> LOGIN PASSWORD '...';
 
--- 2. Create data roles (NOLOGIN — used via SET LOCAL ROLE)
-CREATE ROLE ch_admin NOLOGIN;
-CREATE ROLE ch_practitioner NOLOGIN;
-CREATE ROLE ch_client NOLOGIN;
-CREATE ROLE ch_system NOLOGIN;
+-- 2. Create data roles (NOLOGIN — switched to via SET LOCAL ROLE)
+CREATE ROLE <role_1> NOLOGIN;
+CREATE ROLE <role_2> NOLOGIN;
+CREATE ROLE <system_role> NOLOGIN;
 
--- 3. Grant data roles to login role
-GRANT ch_admin, ch_practitioner, ch_client, ch_system TO visitor_role;
-GRANT USAGE ON SCHEMA public TO visitor_role, ch_admin, ch_practitioner, ch_client, ch_system;
+-- 3. Grant all data roles to the login role
+GRANT <role_1>, <role_2>, <system_role> TO <login_role>;
 
--- 4. Grant table permissions to data roles
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ch_admin;
--- (similar for other roles with appropriate restrictions)
+-- 4. Grant schema usage to all roles
+GRANT USAGE ON SCHEMA public TO <login_role>, <role_1>, <role_2>, <system_role>;
 
--- 5. Set default privileges for future tables
+-- 5. Grant table permissions per role
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO <role_1>;  -- read-only
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO <role_2>;  -- full CRUD
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO <system_role>;
+
+-- 6. Set default privileges (so future tables inherit grants)
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ch_admin;
+  GRANT SELECT ON TABLES TO <role_1>;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO <system_role>;
+```
+
+#### Step 3: Write RLS policies referencing your roles
+```sql
+-- Public read (any authenticated visitor)
+CREATE POLICY "public_read" ON media FOR SELECT TO <role_1> USING (true);
+
+-- Org-scoped access
+CREATE POLICY "org_scoped" ON clients FOR ALL TO <role_2>
+  USING (org_id = current_setting('app.current_org_id')::int);
+
+-- System bypass
+CREATE POLICY "system_all" ON clients FOR ALL TO <system_role> USING (true);
 ```
 
 ### Schema Conventions
@@ -671,202 +443,13 @@ npm run gen:auth       # Regenerates auth schema from better-auth config
 ```
 Migration files in `drizzle/` — never hand-edit. If you need a custom migration, use Drizzle Kit's `custom` option.
 
-### Drizzle-Zod Schema Generation
-
-**CRITICAL RULE:** Use `drizzle-zod` helpers to generate Zod schemas from Drizzle tables. Never manually write schemas that duplicate table structure.
-
-#### Installation
-```bash
-npm install drizzle-zod
-```
-
-#### Pattern: Single Source of Truth
-
+### Drizzle-Zod Derivation
 ```typescript
-// ❌ ANTI-PATTERN: Manual schema duplication
-import { z } from 'zod';
-
-const ClientSchema = z.object({
-  id: z.number(),
-  orgId: z.number(),
-  name: z.string(),
-  email: z.string().email(),
-  createdAt: z.date(),
-  updatedAt: z.date(),
-  // ⚠️ If table changes, this breaks silently!
-});
-
-// ✅ CORRECT: Generate from Drizzle table
-import { createInsertSchema, createSelectSchema } from 'drizzle-zod';
-import { clients } from './schema/clients';
-
-// Full schemas
-export const selectClientSchema = createSelectSchema(clients);
-export const insertClientSchema = createInsertSchema(clients);
-
-// API-specific refinements
-export const createClientSchema = insertClientSchema
-  .omit({ id: true, createdAt: true, updatedAt: true }) // auto-generated fields
-  .extend({
-    email: z.string().email().toLowerCase(), // additional validation
-  });
-
-export const updateClientSchema = insertClientSchema
-  .omit({ id: true, orgId: true, createdAt: true, updatedAt: true })
-  .partial(); // all fields optional for PATCH
-
-export const clientResponseSchema = selectClientSchema
-  .omit({ orgId: true }); // don't expose internal IDs in API responses
+import { createSelectSchema, createInsertSchema } from 'drizzle-zod';
+const ClientSelect = createSelectSchema(clients);
+const ClientInsert = createInsertSchema(clients);
 ```
-
-#### Available Helpers
-
-```typescript
-import { 
-  createInsertSchema,  // For INSERT operations (excludes auto-generated fields)
-  createSelectSchema,  // For SELECT results (all fields)
-  createUpdateSchema,  // For UPDATE operations (like insert but may differ)
-} from 'drizzle-zod';
-
-const insertSchema = createInsertSchema(clients);    // Omits serial/identity PKs
-const selectSchema = createSelectSchema(clients);    // Includes all columns
-const updateSchema = createUpdateSchema(clients);    // Same as insert by default
-```
-
-#### Refining Generated Schemas
-
-```typescript
-import { createInsertSchema } from 'drizzle-zod';
-import { clients } from './schema/clients';
-import { z } from 'zod';
-
-// Add custom validation beyond what Drizzle knows
-export const insertClientSchema = createInsertSchema(clients, {
-  email: z.string().email().toLowerCase(),           // additional transform
-  name: z.string().min(2).max(100),                  // length constraints
-  phone: z.string().regex(/^\d{10}$/).optional(),    // format validation
-});
-
-// Create endpoint-specific variants
-export const createClientSchema = insertClientSchema
-  .omit({ id: true, createdAt: true, updatedAt: true });
-
-export const updateClientSchema = insertClientSchema
-  .omit({ id: true, orgId: true, createdAt: true, updatedAt: true })
-  .partial();  // all fields optional
-
-export const patchClientNameSchema = insertClientSchema
-  .pick({ name: true });  // only allow name updates on this endpoint
-```
-
-#### Usage in API Routes
-
-```typescript
-// lib/api/routes/practitioner/clients.ts
-import { createRoute } from '@hono/zod-openapi';
-import { 
-  createClientSchema, 
-  updateClientSchema, 
-  clientResponseSchema 
-} from '~/lib/db/schema/clients.zod';
-
-const createRoute = createRoute({
-  method: 'post',
-  path: '/clients',
-  request: {
-    body: {
-      content: {
-        'application/json': { schema: createClientSchema },
-      },
-    },
-  },
-  responses: {
-    201: {
-      content: {
-        'application/json': { schema: clientResponseSchema },
-      },
-      description: 'Client created',
-    },
-  },
-});
-
-router.openapi(createRoute, async (c) => {
-  const data = c.req.valid('json');  // ✅ Typed as createClientSchema
-  const query = c.get('query');
-
-  const [client] = await query
-    .insert(clients)
-    .values(data)
-    .returning();
-
-  return c.json(client, 201);  // ✅ Typed as clientResponseSchema
-});
-```
-
-#### Why This Matters
-
-**Single source of truth:**
-```
-Drizzle table definition
-  ↓ (drizzle-zod generates)
-Zod schemas
-  ↓ (used in createRoute)
-OpenAPI spec
-  ↓ (npm run gen:api)
-TypeScript types
-  ↓ (used in frontend)
-Fully typed API calls
-```
-
-**Change the table, everything updates:**
-1. Add column to Drizzle schema
-2. Run `npm run db:generate && npm run db:migrate`
-3. Zod schemas auto-update (they're derived, not manual)
-4. Run `npm run gen:api`
-5. TypeScript errors show every API call that needs updating
-
-**Without drizzle-zod:**
-- Change table → manually update Zod schema → easy to forget fields
-- Schemas drift from tables over time
-- Runtime errors from schema mismatches
-
-#### File Organization
-
-```
-lib/db/schema/
-  clients.ts           # Drizzle table definition
-  clients.zod.ts       # Generated Zod schemas + API refinements
-  index.ts             # Barrel exports
-```
-
-```typescript
-// clients.zod.ts
-import { createInsertSchema, createSelectSchema } from 'drizzle-zod';
-import { clients } from './clients';
-import { z } from 'zod';
-
-export const selectClientSchema = createSelectSchema(clients);
-export const insertClientSchema = createInsertSchema(clients);
-
-export const createClientSchema = insertClientSchema
-  .omit({ id: true, createdAt: true, updatedAt: true });
-
-export const updateClientSchema = insertClientSchema
-  .omit({ id: true, orgId: true, createdAt: true, updatedAt: true })
-  .partial();
-
-export const clientResponseSchema = selectClientSchema
-  .omit({ orgId: true });  // don't leak internal IDs
-```
-
-**Import pattern:**
-```typescript
-// ✅ Import from .zod file for API routes
-import { createClientSchema } from '~/lib/db/schema/clients.zod';
-
-// ✅ Import table from base file for queries
-import { clients } from '~/lib/db/schema/clients';
-```
+Derive from Drizzle, extend for API-specific shapes. Never duplicate the schema definition.
 
 ## 5. AUTH PATTERNS (better-auth)
 
@@ -1111,14 +694,18 @@ Execute in this order:
 1. `npm create cloudflare@latest` or `cargo init` (per CLAUDE.md language rules)
 2. Configure biome, vitest, husky + lint-staged
 3. Initialize Drizzle with Neon connection
-4. Create `db-init-roles.ts` script for RLS role setup
+4. **Define your RLS roles for this project.** Ask: what are the user types? What data should each type access? Create the role table:
+   - Login role name (e.g., `app_visitor`, `dt_visitor`)
+   - Data roles and their permissions (e.g., `app_admin` = full CRUD within org, `app_user` = read own data, `app_system` = unrestricted)
+   - Write `scripts/db-init-roles.ts` implementing these roles with grants and default privileges
+   - Run the script against the Neon project
 5. Set up better-auth with email OTP
 6. Create the API app with OpenAPIHono + health route
 7. Wire TanStack Start with root route + auth guard
 8. Install shadcn components (button, input, label, card minimum)
 9. Build auth pages with AuthLayout
 10. Build application shell with Sidebar
-11. Set up CI + preview workflow
+11. Set up CI + preview workflow (use the login role name from step 4 in the Neon connection string for Hyperdrive)
 12. Generate initial `v1.d.ts` with `gen:api`
 
 ## 8. WHEN REFACTORING AN EXISTING PROJECT
@@ -1143,5 +730,3 @@ Assess in this order:
 - **Missing seed step in preview workflow** — empty tables on preview = broken preview.
 - **Neon Auth cookie forwarding without the correct pattern** — must forward the raw cookie header, not use browser client server-side.
 - **Duplicated auth middleware** — session validation in two files inevitably drifts. Single source of truth.
-- **Unbounded list endpoints** — returning all rows without pagination causes timeouts and crashes on production data. Every list endpoint MUST have `page` + `limit` parameters and return paginated responses.
-- **Manual Zod schemas duplicating Drizzle tables** — use `createInsertSchema`/`createSelectSchema` from drizzle-zod. Manual schemas drift from tables and break silently.
