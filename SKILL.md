@@ -460,67 +460,493 @@ src/lib/auth/
 ```
 
 ### Server Auth Factory (lib/auth/better-auth.ts)
-Two exports:
-1. **`betterAuthOptions`** — shared config (plugins, email settings, ID generation). Used by both the Worker runtime and the CLI config.
-2. **`createAuth(db, env, ctx)`** — creates a fully-configured better-auth instance per-request. Adds:
-   - Trusted origins
-   - Organization plugin with invitation hooks (e.g., auto-create care team assignment on client invite accept)
-   - Cookie prefix per environment (`ch_${env.APP_ENV}`)
-   - KV-backed secondary storage for session caching
-   - Background task handler via `ctx.waitUntil`
+
+**Pattern: Shared config + per-request factory**
+
+```typescript
+import { betterAuth } from "better-auth";
+import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { admin, emailOTP, jwt } from "better-auth/plugins";
+import type { Env } from "~/env";
+import type { Database } from "~/lib/db/client";
+
+/**
+ * Stub for OTP sending — logs to console in dev, wire SES later.
+ */
+const sendVerificationOTP: Parameters<
+  typeof emailOTP
+>[0]["sendVerificationOTP"] = async ({ email, otp }) => {
+  console.log(`[auth] OTP for ${email}: ${otp}`);
+};
+
+/**
+ * Shared config for both runtime and CLI generation.
+ * Does NOT include request-scoped values (trustedOrigins, DB, KV).
+ */
+export const betterAuthOptions = {
+  plugins: [admin(), emailOTP({ sendVerificationOTP }), jwt()],
+  emailAndPassword: {
+    enabled: true,
+    requireEmailVerification: true,
+  },
+  advanced: {
+    database: {
+      generateId: "serial" as const,  // ✅ Use integer identity PKs, not UUIDs
+    },
+  },
+};
+
+/**
+ * Creates a fully-configured better-auth instance per-request.
+ * Must be called with a fresh DB connection + Worker env + execution context.
+ */
+export function createAuth(db: Database, env: Env, _ctx: ExecutionContext) {
+  const appEnv = env.APP_ENV || "dev";
+  const appUrl = env.APP_URL || env.WORKER_URL || "http://localhost:3000";
+
+  return betterAuth({
+    ...betterAuthOptions,
+    database: drizzleAdapter(db, { provider: "pg" }),
+    secret: env.BETTER_AUTH_SECRET,
+    baseURL: appUrl,
+    basePath: "/api/auth",
+    trustedOrigins: [appUrl],
+    emailAndPassword: {
+      ...betterAuthOptions.emailAndPassword,
+      sendResetPassword: async ({ user, url }) => {
+        console.log(`[auth] Password reset for ${user.email}: ${url}`);
+        // TODO: Wire SES email sending
+      },
+    },
+    emailVerification: {
+      sendVerificationEmail: async ({ user, url }) => {
+        console.log(`[auth] Verification email for ${user.email}: ${url}`);
+        // TODO: Wire SES email sending
+      },
+      sendOnSignUp: true,
+    },
+    plugins: [admin(), emailOTP({ sendVerificationOTP }), jwt()],
+    advanced: {
+      ...betterAuthOptions.advanced,
+      cookiePrefix: `app_${appEnv}`,  // Different cookie per environment
+    },
+    secondaryStorage: env.KV
+      ? {
+          get: async (key: string) => {
+            return (await env.KV.get(key)) ?? null;
+          },
+          set: async (key: string, value: string, ttl?: number) => {
+            await env.KV.put(
+              key,
+              value,
+              ttl ? { expirationTtl: ttl } : undefined,
+            );
+          },
+          delete: async (key: string) => {
+            await env.KV.delete(key);
+          },
+        }
+      : undefined,  // KV is optional — falls back to DB-only sessions
+    databaseHooks: {
+      session: {
+        create: {
+          after: async () => {
+            // Background task hook — use ctx.waitUntil for analytics, cache warming
+          },
+        },
+      },
+    },
+  });
+}
+
+export type Auth = ReturnType<typeof createAuth>;
+```
+
+**Key patterns:**
+1. **Export `betterAuthOptions`** - Used by both runtime and CLI (better-auth.config.ts)
+2. **`generateId: "serial"`** - Use integer identity PKs (not UUIDs) for better-auth tables
+3. **Per-request factory** - `createAuth(db, env, execCtx)` creates fresh instance with bindings
+4. **Environment-specific cookies** - `cookiePrefix: "app_${appEnv}"` (dev/preview/prod)
+5. **KV secondary storage** - Cache sessions in KV (optional but recommended)
+6. **Stub email callbacks** - Console logs in dev, wire SES later
 
 ### CLI Config (./better-auth.config.ts)
+
+```typescript
+import { betterAuthOptions } from "./src/lib/auth/better-auth";
+
+export default {
+  ...betterAuthOptions,
+};
+```
+
 Used by `npm run gen:auth` to generate the auth schema at `src/lib/db/schema/auth.ts`:
 ```bash
 npx @better-auth/cli@latest generate --config ./better-auth.config.ts --output ./src/lib/db/schema/auth.ts
 ```
-This reads `betterAuthOptions` + a direct DB connection to introspect/generate the Drizzle schema for auth tables (user, session, account, verification, organization, member, invitation).
+This reads `betterAuthOptions` + a direct DB connection to introspect/generate the Drizzle schema for auth tables (user, session, account, verification, etc.).
+
+**Add to package.json:**
+```json
+{
+  "scripts": {
+    "gen:auth": "better-auth generate --config ./better-auth.config.ts --output ./src/lib/db/schema/auth.ts"
+  }
+}
+```
+
+### API Middleware (Hono)
+
+**1. Setup Middleware** (lib/api/middleware/setup.ts)
+
+Creates DB and auth instances per-request from Worker bindings:
+
+```typescript
+import type { Context, Next } from "hono";
+import { createAuth } from "~/lib/auth/better-auth";
+import { createDb } from "~/lib/db/client";
+import type { ApiContext } from "../types";
+
+/**
+ * Creates DB and auth instances per-request from Worker bindings.
+ * Must run before any route that needs DB or auth access.
+ */
+export async function setupMiddleware(
+  c: Context<ApiContext>,
+  next: Next,
+): Promise<void> {
+  const db = createDb(c.env.DB.connectionString);
+  
+  // executionCtx may not be available in test environments
+  let execCtx: ExecutionContext;
+  try {
+    execCtx = c.executionCtx as unknown as ExecutionContext;
+  } catch {
+    execCtx = {
+      waitUntil: () => {},
+      passThroughOnException: () => {},
+    } as unknown as ExecutionContext;
+  }
+  
+  const auth = createAuth(db, c.env, execCtx);
+  c.set("db", db);
+  c.set("auth", auth);
+  await next();
+}
+```
+
+**2. Auth Guard Middleware** (lib/api/middleware/auth.ts)
+
+Validates session via better-auth. Returns 401 if no valid session:
+
+```typescript
+import type { Context, Next } from "hono";
+import type { ApiContext } from "../types";
+
+/**
+ * Validates the session via better-auth. Returns 401 if no valid session.
+ * Must run after setupMiddleware (which sets `auth` on the context).
+ */
+export async function authMiddleware(
+  c: Context<ApiContext>,
+  next: Next,
+): Promise<Response | undefined> {
+  const auth = c.get("auth");
+  const session = await auth.api.getSession({
+    headers: c.req.raw.headers,
+  });
+
+  if (!session) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  c.set("session", session);
+  await next();
+}
+```
+
+**3. API Integration** (lib/api/index.ts)
+
+```typescript
+import { OpenAPIHono } from "@hono/zod-openapi";
+import { setupMiddleware } from "./middleware/setup";
+import { authMiddleware } from "./middleware/auth";
+import type { ApiContext } from "./types";
+
+const api = new OpenAPIHono<ApiContext>();
+
+// Global middleware - runs on ALL routes
+api.use("*", setupMiddleware);  // Creates DB + auth per-request
+
+// better-auth passthrough — handles its own auth logic
+api.on(["POST", "GET"], "/api/auth/*", (c) => {
+  const auth = c.get("auth");
+  return auth.handler(c.req.raw);
+});
+
+// Public routes (no auth required)
+api.route("/api/v1/health", healthRouter);
+api.route("/api/v1/public", publicRouter);
+
+// Protected routes - require valid session
+api.use("/api/v1/admin/*", authMiddleware);
+api.route("/api/v1/admin", adminRouter);
+
+api.use("/api/v1/user/*", authMiddleware);
+api.route("/api/v1/user", userRouter);
+
+export default api;
+```
+
+**Key patterns:**
+1. **setupMiddleware runs first** - Creates DB + auth for every request
+2. **`/api/auth/*` passthrough** - Routes directly to `auth.handler(c.req.raw)`
+3. **authMiddleware on protected routes** - Validates session, sets `c.set("session", ...)`
+4. **Session in route handlers** - Access via `c.get("session")`
 
 ### Browser Client (lib/auth/auth-client.ts)
+
 ```typescript
-import { createAuthClient } from 'better-auth/react';
+import {
+  adminClient,
+  emailOTPClient,
+  jwtClient,
+} from "better-auth/client/plugins";
+import { createAuthClient } from "better-auth/react";
+
 export const authClient = createAuthClient({
-  plugins: [organizationClient(), adminClient(), emailOTPClient(), jwtClient()],
+  baseURL: typeof window !== "undefined" ? window.location.origin : "",
+  basePath: "/api/auth",
+  plugins: [adminClient(), emailOTPClient(), jwtClient()],
 });
 ```
-Used in components for: `authClient.signIn.email()`, `authClient.signUp.email()`, `authClient.signOut()`, `authClient.useSession()`, `authClient.useListOrganizations()`, etc.
+
+**Usage in components:**
+```typescript
+// Sign in
+const { data, error } = await authClient.signIn.email({
+  email: "user@example.com",
+  password: "password123",
+});
+
+// Sign up
+const { data, error } = await authClient.signUp.email({
+  email: "user@example.com",
+  password: "password123",
+  name: "User Name",
+});
+
+// Email OTP verification
+const { error } = await authClient.emailOtp.verifyEmail({
+  email: "user@example.com",
+  otp: "123456",
+});
+
+// Sign out
+await authClient.signOut();
+
+// React hook for session
+const { data: session } = authClient.useSession();
+```
 
 ### TanStack Start Server Functions (lib/auth/auth.functions.ts)
-Uses TanStack Start's `createMiddleware` + `createServerFn` pattern:
+
+**Pattern: Middleware creates DB + auth, validates session**
+
 ```typescript
+import { createMiddleware, createServerFn } from "@tanstack/react-start";
+import { getRequestHeaders } from "@tanstack/react-start/server";
+import type { Env } from "~/env";
+import { createDb } from "~/lib/db/client";
+import { createAuth } from "./better-auth";
+import type { AuthSession } from "./types";
+
+/**
+ * Middleware that creates DB + auth and validates the current session
+ * from the incoming request cookies/headers. Injects the session
+ * into server function context.
+ */
 const authMiddleware = createMiddleware().server(async ({ next, context }) => {
-  const { env, executionCtx } = context;
-  const db = createDb(env.DB.connectionString);
-  const auth = createAuth(db, env, executionCtx);
-  const session = await auth.api.getSession({ headers: getRequestHeaders() });
+  const ctx = context as unknown as {
+    env: Env;
+    executionCtx: ExecutionContext;
+  };
+  const db = createDb(ctx.env.DB_VISITOR.connectionString);
+  const auth = createAuth(db, ctx.env, ctx.executionCtx);
+  const headers = getRequestHeaders() as Headers;
+  const session = await auth.api.getSession({ headers });
   return next({ context: { session } });
 });
 
-export const getSession = createServerFn({ method: 'GET' })
+/**
+ * Returns the current session, or null if not authenticated.
+ * Used in __root.tsx beforeLoad to inject session into route context.
+ */
+export const getSessionFn = createServerFn({ method: "GET" })
   .middleware([authMiddleware])
-  .handler(async ({ context }) => context.session);
+  .handler(async ({ context }) => {
+    return context.session as AuthSession | null;
+  });
+
+/**
+ * Returns the current session or throws a redirect to sign-in.
+ * Use in protected route beforeLoad for strict enforcement.
+ */
+export const ensureSessionFn = createServerFn({ method: "GET" })
+  .middleware([authMiddleware])
+  .handler(async ({ context }) => {
+    const session = context.session as AuthSession | null;
+    if (!session) {
+      throw new Error("UNAUTHORIZED");
+    }
+    return session;
+  });
 ```
-**Critical:** This is how SSR routes get the session — through TanStack Start's server function system, NOT through the Hono API middleware. The Hono API has its own auth middleware (`apiMiddlewareRequireAuth`) that uses the same `auth.api.getSession()` but from the Hono context.
+
+**Usage in routes:**
+
+```typescript
+// __root.tsx - inject session into all routes
+export const Route = createRootRoute({
+  beforeLoad: async () => {
+    const session = await getSessionFn();
+    return { session };
+  },
+  component: RootComponent,
+});
+
+// Protected route - require session
+export const Route = createFileRoute("/admin")({
+  beforeLoad: async ({ context }) => {
+    if (!context.session) {
+      throw redirect({ to: "/auth/sign-in" });
+    }
+  },
+  component: AdminPage,
+});
+```
+
+**CRITICAL:** This is how SSR routes get the session — through TanStack Start's server function system, NOT through the Hono API middleware. The Hono API has its own auth middleware that uses the same `auth.api.getSession()` but from the Hono context.
 
 ### Session Flow (Two Paths)
-**SSR path (page loads):**
-1. Root route `beforeLoad` calls `getSession()` server function
-2. Session + user injected into TanStack Router context
-3. Protected routes check `context.session` in `beforeLoad`, redirect to `/auth/sign-in` if missing
 
-**API path (fetch calls):**
-1. `apiMiddlewareSetup` creates auth instance from Hono bindings
-2. `apiMiddlewareRequireAuth` calls `auth.api.getSession({ headers })` with the request headers
-3. Session attached to `c.set('session', session)`
+```
+┌─────────────────────────────────────────────────────────────┐
+│ SSR Path (Page Loads)                                       │
+├─────────────────────────────────────────────────────────────┤
+│ 1. Browser requests /admin                                  │
+│ 2. TanStack Router __root.tsx beforeLoad runs               │
+│ 3. Calls getSessionFn() server function                     │
+│ 4. Server function creates DB + auth from Worker env        │
+│ 5. Calls auth.api.getSession({ headers })                   │
+│ 6. Returns session or null                                  │
+│ 7. Session injected into route context                      │
+│ 8. Route beforeLoad checks context.session                  │
+│ 9. Redirects to /auth/sign-in if missing                    │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ API Path (Fetch Calls)                                      │
+├─────────────────────────────────────────────────────────────┤
+│ 1. Browser calls fetch('/api/v1/admin/users')               │
+│ 2. Hono setupMiddleware creates DB + auth                   │
+│ 3. Hono authMiddleware calls auth.api.getSession({ headers })│
+│ 4. Returns 401 if no session                                │
+│ 5. Sets c.set('session', session)                           │
+│ 6. Route handler accesses via c.get('session')              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key insight:** Two independent auth flows using the same `auth.api.getSession()` method:
+- **TanStack Start:** For SSR page loads (server functions)
+- **Hono API:** For client-side fetch calls (API middleware)
+
+### Environment Variables (Env type)
+
+Add to `src/env.ts`:
+
+```typescript
+export interface Env {
+  DB_VISITOR: Hyperdrive;
+  KV?: KVNamespace;  // Optional - for session caching
+  
+  APP_ENV: string;  // "dev" | "preview" | "production"
+  APP_URL: string;  // "https://your-app.com"
+  BETTER_AUTH_SECRET: string;  // Generate: openssl rand -base64 32
+  
+  WORKER_URL?: string;  // Auto-set by Cloudflare in preview
+}
+```
+
+**Secrets setup:**
+
+```bash
+# Local (.env)
+BETTER_AUTH_SECRET="your-secret-key"
+APP_URL="http://localhost:3000"
+APP_ENV="dev"
+
+# Production (Cloudflare dashboard or wrangler)
+npx wrangler secret put BETTER_AUTH_SECRET
+```
 
 ### Plugins
-- **organization** — multi-tenancy (practices), invitation system, role-based membership
-- **emailOTP** — email verification codes for sign-up and sign-in
-- **admin** — admin-level user management
-- **jwt** — JWT token support
 
-### Auth Pages
-Split-screen layout: left form panel + right brand panel with AuthLayout component. Auth flow includes email+password with OTP email verification. Each page (sign-in, sign-up, forgot-password, reset-password) focuses only on form logic.
+- **admin** — Admin-level user management (`isAdmin` flag on user)
+- **emailOTP** — Email verification codes for sign-up and email verification
+- **jwt** — JWT token support for API integrations
+
+**Optional plugins:**
+- **organization** — Multi-tenancy (orgs, members, invitations, roles)
+- **twoFactor** — TOTP-based 2FA
+- **magicLink** — Passwordless email links
+
+### Auth Pages Pattern
+
+**Split-screen layout:** Left form panel + right brand panel
+
+```typescript
+// components/blocks/auth-layout.tsx
+export function AuthLayout({
+  title,
+  description,
+  children,
+  footer,
+}: {
+  title: string;
+  description?: string;
+  children: ReactNode;
+  footer?: ReactNode;
+}) {
+  return (
+    <div className="flex min-h-[100dvh]">
+      {/* Left — form panel */}
+      <div className="flex w-full flex-col md:w-5/12">
+        <div>
+          <Link to="/" className="inline-flex items-baseline gap-1">
+            <span className="font-serif text-foreground">your</span>
+            <span className="font-serif text-primary">app</span>
+          </Link>
+        </div>
+
+        <div className="mx-auto w-full max-w-sm">
+          <h1 className="text-2xl font-semibold">{title}</h1>
+          {description && <p className="text-muted-foreground">{description}</p>}
+          {children}
+          {footer}
+        </div>
+      </div>
+
+      {/* Right — brand panel (hidden on mobile) */}
+      <div className="hidden flex-1 bg-primary md:flex">
+        {/* Brand imagery, tagline, etc. */}
+      </div>
+    </div>
+  );
+}
+```
+
+**Auth flow:** email+password with OTP email verification. Each page (sign-in, sign-up, forgot-password, reset-password) focuses only on form logic and delegates to `authClient` methods.
 
 ## 5. FRONTEND PATTERNS
 
